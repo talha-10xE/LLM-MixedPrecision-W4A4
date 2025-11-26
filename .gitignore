@@ -3,6 +3,7 @@ MNIST_Example/dataset/
 
 # Optional: Ignore the pre-trained model file too (since it's large)
 MNIST_Example/mnist_model_fp32_baseline.pth
+MNIST_Example/mnist_model_int4_w8x8.pth
 
 # Common ignores for Python projects
 __pycache__/
