@@ -19,6 +19,7 @@ def symmetric_quantize_and_pack(W_fp32):
     Returns:
     - packed_int4_weights: (torch.uint8) Packed INT4 data (2 INT4 values per byte).
     - scale_factors: (torch.float32) Scale factors for each 8x8 tile.
+    - unpadded_shape: (tuple) The original, unpadded shape (R_in, C_out) of the transposed tensor.
     """
     R_in, C_out = W_fp32.shape
     
@@ -29,140 +30,120 @@ def symmetric_quantize_and_pack(W_fp32):
 
     if R_padded != R_in or C_padded != C_out:
         # Create a new tensor initialized to zeros for padding
-        W_padded = torch.zeros(R_padded, C_padded, dtype=W_fp32.dtype)
+        W_padded = torch.zeros((R_padded, C_padded), dtype=W_fp32.dtype, device=W_fp32.device)
         # Copy the original weights into the top-left corner
         W_padded[:R_in, :C_out] = W_fp32
-        W_to_quantize = W_padded
-        print(f"  -> Padded from ({R_in}, {C_out}) to ({R_padded}, {C_padded}) for tiling.")
     else:
-        W_to_quantize = W_fp32
-    
-    # Recalculate tile counts based on padded dimensions
-    num_tiles_r = R_padded // TILE_SIZE
-    num_tiles_c = C_padded // TILE_SIZE
-    
-    # Initialize lists to hold the scales and the packed quantized data
+        W_padded = W_fp32
+
+    # --- Quantization Parameters ---
+    R_p, C_p = W_padded.shape
+    num_tiles_r = R_p // TILE_SIZE
+    num_tiles_c = C_p // TILE_SIZE
+
+    # Pre-allocate lists for results
+    int4_tiles = []
     scale_factors = []
-    quantized_tiles = []
 
-    # Iterate over the padded weight matrix in 8x8 blocks
-    for r_block in range(num_tiles_r):
-        for c_block in range(num_tiles_c):
-            # Define tile boundaries
-            r_start, r_end = r_block * TILE_SIZE, (r_block + 1) * TILE_SIZE
-            c_start, c_end = c_block * TILE_SIZE, (c_block + 1) * TILE_SIZE
+    # Iterate over 8x8 tiles
+    for i in range(num_tiles_r):
+        for j in range(num_tiles_c):
+            r_start, r_end = i * TILE_SIZE, (i + 1) * TILE_SIZE
+            c_start, c_end = j * TILE_SIZE, (j + 1) * TILE_SIZE
             
-            # W_to_quantize is now guaranteed to have dimensions R_padded x C_padded
-            W_tile = W_to_quantize[r_start:r_end, c_start:c_end]
+            # Extract the 8x8 tile
+            W_tile = W_padded[r_start:r_end, c_start:c_end]
             
-            # --- Step 1: Calculate 99th Percentile Clip Threshold (T_99) ---
-            # We use the 99th percentile of the absolute values to set the range.
-            abs_W = torch.abs(W_tile)
-            # Flatten to 1D and use torch.quantile for percentile calculation
-            T_99 = torch.quantile(abs_W.flatten(), CLIP_PERCENTILE / 100.0)
+            # 1. Determine the maximum range for the tile (using 99th percentile clipping)
+            # Find the absolute value at the 99th percentile
+            abs_W_tile = torch.abs(W_tile)
             
-            # If the calculated threshold is close to zero, prevent division by zero
-            if T_99.item() < 1e-6:
-                 S = torch.tensor(1.0)
-                 T_99 = torch.tensor(0.0) # Ensure no clipping if range is zero
-            else:
-                 # --- Step 2: Calculate Scale Factor (S) ---
-                 # S = T_99 / 7 (since max INT4 is 7 for symmetric)
-                 S = T_99 / INT4_MAX 
-
-            scale_factors.append(S.item())
+            # Using torch.quantile is safer than a manual sort for 99th percentile
+            # We use the max abs value if the tile is all zero (to prevent S=0/NaN/Inf scale)
+            # but since we are padding with zeros, a non-zero tile size is guaranteed for non-zero weights.
+            max_val = torch.quantile(abs_W_tile.flatten(), CLIP_PERCENTILE / 100.0)
             
-            # --- Step 3: Quantize and Clip ---
-            # 1. Clip the FP32 tile values to the determined range [-T_99, T_99]
-            W_clipped = torch.clamp(W_tile, -T_99, T_99)
+            # Handle the case where the max_val is extremely small (near zero)
+            # Set a minimum clipping value to avoid division by zero or massive quantization error
+            max_val = max(max_val, 1e-6) 
             
-            # 2. Quantize: W_int = round(W_clipped / S)
-            W_int = torch.round(W_clipped / S)
+            # 2. Calculate the scale factor (S)
+            # S = Max_Value / Max_Quantization_Range
+            S = max_val / INT4_MAX
             
-            # 3. Clip W_int to the final INT4 range [-8, 7]
-            W_int_final = torch.clamp(W_int, -INT4_MAX - 1, INT4_MAX).to(torch.int8)
+            # 3. Quantize the FP32 tile to signed INT4
+            # Q = round(W / S)
+            Q_tile = torch.round(W_tile / S).to(torch.int8)
+            
+            # 4. Clip the quantized values to the target range [-8, 7]
+            Q_tile = torch.clamp(Q_tile, -INT4_MAX - 1, INT4_MAX) # Clips to [-8, 7]
+            
+            # 5. Pack the signed INT4 into UINT8
+            # Convert signed INT4 [-8, 7] to unsigned 4-bit [0, 15] by adding offset 8
+            W_uint4 = (Q_tile + 8).to(torch.uint8)
+            
+            # Pack two 4-bit values into one 8-bit byte
+            # Group every two elements: [a, b, c, d, ...] -> [(b << 4) | a, (d << 4) | c, ...]
+            # The indices for pairing are [0, 1], [2, 3], etc.
+            W_uint4_flat = W_uint4.flatten()
+            
+            # Check if total number of elements is even
+            if W_uint4_flat.numel() % 2 != 0:
+                # This should only happen if the padded size is uneven, which is impossible with TILE_SIZE=8.
+                # However, for safety, we pad with one more zero if needed.
+                W_uint4_flat = torch.cat((W_uint4_flat, torch.tensor([0], dtype=torch.uint8, device=W_padded.device)))
+            
+            low_nibbles = W_uint4_flat[::2]
+            high_nibbles = W_uint4_flat[1::2]
+            
+            packed_byte = (high_nibbles << 4) | low_nibbles
+            
+            # Store results
+            int4_tiles.append(packed_byte)
+            scale_factors.append(S)
 
-            quantized_tiles.append(W_int_final.flatten())
+    # Concatenate all tiles into single tensors
+    packed_weights = torch.cat(int4_tiles).contiguous()
+    scale_factors = torch.tensor(scale_factors, dtype=torch.float32)
 
-    # Concatenate all 8x8 tiles into one long vector of INT4 data
-    all_int4_data = torch.cat(quantized_tiles)
+    return packed_weights, scale_factors, (R_in, C_out) # Return UNPADDED shape
 
-    # --- Step 4: Pack the INT4 data into UINT8 (2 INT4 values per byte) ---
-    
-    # We need to ensure we have an even number of elements for pairing
-    if all_int4_data.numel() % 2 != 0:
-        # Should not happen if all dimensions are multiples of 8, but for robustness:
-        print("Warning: Odd number of elements. Padding with zero.")
-        padding = torch.zeros(1, dtype=torch.int8)
-        all_int4_data = torch.cat([all_int4_data, padding])
-
-    # INT4 values must be in the range [-8, 7]. We want to pack two of them.
-    # W_int has shape (N)
-    # We pair (W_int[0], W_int[1]), (W_int[2], W_int[3]), ...
-    
-    # The packing strategy: (Low nibble, High nibble)
-    # Byte = (W_int_1 & 0x0F) | ((W_int_2 & 0x0F) << 4)
-    # Since W_int is signed, we need to handle the negative values correctly.
-    # The 4-bit representation of -8 is (1000)_2, 7 is (0111)_2.
-    
-    # 1. Cast to unsigned 4-bit (0-15) for packing convenience
-    # Add 8 to shift [-8, 7] to [0, 15].
-    W_uint4 = (all_int4_data + 8).to(torch.uint8)
-
-    # 2. Reshape W_uint4 to (N/2, 2)
-    W_uint4_paired = W_uint4.view(-1, 2)
-
-    # 3. Pack: low nibble is the first element, high nibble is the second
-    packed_weights = (W_uint4_paired[:, 0] & 0x0F) | (W_uint4_paired[:, 1] << 4)
-    
-    # Reshape scale_factors list to tensor
-    scale_tensor = torch.tensor(scale_factors, dtype=torch.float32)
-    
-    return packed_weights, scale_tensor
-
-
-def quantize_and_save_model():
+def quantize_model(model_path_in, model_path_out):
     """
-    Main function to load the FP32 model, quantize weights using the
-    defined symmetric W4-8x8 scheme, and save the result.
+    Loads the FP32 model, quantizes its weight tensors, and saves the custom state dict.
     """
+    print(f"--- Quantizing Model Weights: {model_path_in} -> {model_path_out} ---")
+    
     try:
-        # Load the state dictionary from the trained model file
-        state_dict = torch.load(MODEL_PATH_IN, map_location='cpu')
-        print(f"--- Loaded FP32 Weights from: {MODEL_PATH_IN} ---")
+        # Load the FP32 state dict (CPU is sufficient for quantization)
+        state_dict = torch.load(model_path_in, map_location='cpu')
     except FileNotFoundError:
-        print(f"Error: Model file '{MODEL_PATH_IN}' not found.")
-        print("Please ensure you have generated the baseline model.")
-        return
-    except Exception as e:
-        print(f"An error occurred while loading the model: {e}")
+        print(f"Error: FP32 baseline model not found at {model_path_in}. Please run main.py first.")
         return
 
-    # Dictionary to hold the quantized components
     quantized_state = OrderedDict()
     
-    print(f"\n--- Quantizing Weights and Saving to: {MODEL_PATH_OUT} ---")
-
+    # Iterate through all parameters in the state dict
     for name, W_fp32 in state_dict.items():
+        
         if name.endswith('.weight'):
-            print(f"Quantizing {name} (Shape: {W_fp32.shape})...")
+            print(f"Processing layer: {name} (Original shape: {list(W_fp32.shape)})")
             
-            # --- CRITICAL STEP: Transpose the weight matrix for memory efficiency ---
-            # PyTorch: (Out_Features, In_Features) -> Saved: (In_Features, Out_Features)
+            # 1. Transpose the weight matrix: PyTorch is (Out x In), we quantize (In x Out)
             W_transposed = W_fp32.T
             
-            # Quantize the transposed weights (padding happens inside this function)
-            packed_weights, scale_factors = symmetric_quantize_and_pack(W_transposed)
+            # 2. Quantize and pack the data
+            packed_weights, scale_factors, unpadded_shape = symmetric_quantize_and_pack(W_transposed)
             
-            # Save the quantized data and scales
+            # Store the packed data and metadata
             quantized_state[f'{name}.packed_int4'] = packed_weights
             quantized_state[f'{name}.scales'] = scale_factors
             
-            # Also save the original shape and the transposed shape for reference
-            # The kernel needs the original shape to know the actual dimensions
-            # of the output tensor.
-            quantized_state[f'{name}.original_shape'] = torch.tensor(W_fp32.shape)
-            quantized_state[f'{name}.transposed_shape'] = torch.tensor(W_transposed.shape)
+            # Store the original/final shape for the model layer (Out x In)
+            quantized_state[f'{name}.original_shape'] = torch.tensor(list(W_fp32.shape))
+            
+            # CRITICAL FIX: Store the UNPADDED transposed shape (In x Out) for dequantization slicing
+            quantized_state[f'{name}.unpadded_transposed_shape'] = torch.tensor(unpadded_shape)
 
             # Store biases as FP32 (typically kept at high precision)
             bias_name = name.replace('.weight', '.bias')
@@ -189,8 +170,7 @@ def quantize_and_save_model():
 
     # Save the custom state dictionary
     torch.save(quantized_state, MODEL_PATH_OUT)
-    print(f"\n--- Custom Quantized Model Saved Successfully! ---")
+    print(f"\nSuccessfully saved quantized model to {MODEL_PATH_OUT}")
 
-
-if __name__ == "__main__":
-    quantize_and_save_model()
+if __name__ == '__main__':
+    quantize_model(MODEL_PATH_IN, MODEL_PATH_OUT)
